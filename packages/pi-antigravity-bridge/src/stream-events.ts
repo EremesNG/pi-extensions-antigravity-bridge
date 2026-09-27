@@ -21,6 +21,8 @@ export type AgyStepType = "user_input" | "checkpoint" | "agent_response" | "tool
 export interface AgyToolInfo {
 	name?: string;
 	parameters?: Record<string, unknown>;
+	/** Completed native tool output (observed on step_update.tool_info). */
+	output?: string;
 	[key: string]: unknown;
 }
 

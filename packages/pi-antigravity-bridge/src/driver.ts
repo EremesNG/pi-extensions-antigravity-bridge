@@ -526,7 +526,16 @@ export class StreamDriver implements TurnDriver {
 							stepId: s.step_index,
 							name,
 							args,
-							output: typeof s.response_text === "string" ? s.response_text : undefined,
+							// Newer stream-json frames put native tool output under
+							// tool_info.output. Prefer that field when it is a string,
+							// including an explicit empty string; retain response_text
+							// for older agy builds and ignore malformed values.
+							output:
+								typeof s.tool_info?.output === "string"
+									? s.tool_info.output
+									: typeof s.response_text === "string"
+										? s.response_text
+										: undefined,
 							durationSeconds: s.duration_seconds,
 						});
 					} else if (s.state === "ERROR") {
