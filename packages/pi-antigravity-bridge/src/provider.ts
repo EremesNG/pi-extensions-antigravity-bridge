@@ -61,7 +61,11 @@ function zeroUsage(): Usage {
 
 /** Extract the latest user message as a flat prompt string. agy maintains its
  *  own conversation history via --conversation, so we collapse pi's structured
- *  message to text. Returns null if the last message isn't a user message. */
+ *  message to text. Returns null if the last message isn't a user message.
+ *
+ * This last-message behavior is retained for ACP; stream-json uses the bounded
+ * suffix helper below because Pi converts trailing CustomMessages to user
+ * messages before a provider sees the transcript. */
 function extractUserPrompt(context: TranscriptContext): string | null {
 	const last = context.messages[context.messages.length - 1];
 	if (!last || last.role !== "user") return null;
@@ -73,6 +77,39 @@ function extractUserPrompt(context: TranscriptContext): string | null {
 		.map((b) => b.text)
 		.join("\n")
 		.trim() || null;
+}
+
+/** Index of the first message in the final contiguous user suffix. */
+function streamJsonUserSuffixStart(messages: readonly Message[]): number {
+	let start = messages.length;
+	while (start > 0 && messages[start - 1].role === "user") start -= 1;
+	return start;
+}
+
+/**
+ * Extract the final contiguous user-message suffix for stream-json. Pi's
+ * `convertToLlm()` turns a hidden/display-only CustomMessage into a normal
+ * user message, so selecting only the last message would drop the current
+ * request when that context follows it. Stop at every non-user role (notably
+ * assistant/toolResult) rather than searching backward for an arbitrary user.
+ * Context remains plain user text; it is not promoted to system instructions.
+ */
+function extractStreamJsonPrompt(context: TranscriptContext): string | null {
+	const parts: string[] = [];
+	const start = streamJsonUserSuffixStart(context.messages);
+	for (let i = start; i < context.messages.length; i++) {
+		const content = context.messages[i].content;
+		const text =
+			typeof content === "string"
+				? content
+				: content
+						.filter((b): b is { type: "text"; text: string } => b.type === "text")
+						.map((b) => b.text)
+						.join("\n")
+						.trim();
+		if (text) parts.push(text);
+	}
+	return parts.length > 0 ? parts.join("\n\n") : null;
 }
 
 /** Image blocks of the latest user message (pi-ai ImageContent: base64 data
@@ -179,6 +216,9 @@ export interface DigestOptions {
 	ownProvider?: string;
 	/** Soft cap on the digest body (0 = unbounded). Default 8000. */
 	maxChars?: number;
+	/** Exclude the whole final contiguous user suffix instead of only the last
+	 *  message. Stream-json uses this because that suffix is sent as one prompt. */
+	excludeTrailingUserSuffix?: boolean;
 }
 
 /** Build a delta digest of pi-side context agy was not spawned for: the most
@@ -203,11 +243,18 @@ export function buildContextDigest(
 
 	let summaryPart: string | null = null;
 	const deltaParts: string[] = [];
+	// Stream-json sends the entire final user suffix as the prompt. The digest
+	// must inspect only the prefix before that suffix, or a compaction summary
+	// inside the suffix would be sent once in each channel. ACP leaves this at
+	// the full transcript to preserve its legacy behavior.
+	const digestPrefixEnd = opts.excludeTrailingUserSuffix
+		? streamJsonUserSuffixStart(messages)
+		: messages.length;
 
-	// 1. Most-recent compaction summary (scan the whole list; it is never in
-	//    agy's DB, so it is always safe and high-value to inject).
+	// 1. Most-recent pre-suffix compaction summary (it is never in agy's DB,
+	//    so it is safe and high-value to inject).
 	let lastCompactionIdx = -1;
-	for (let i = messages.length - 1; i >= 0; i--) {
+	for (let i = digestPrefixEnd - 1; i >= 0; i--) {
 		const m = messages[i];
 		if (m.role !== "user") continue;
 		const t = blocksToText(m.content);
@@ -218,11 +265,14 @@ export function buildContextDigest(
 		}
 	}
 
-	// 2. Delta since the watermark, excluding the trailing current prompt.
-	//    Clamp start to just after the compaction summary when one is present.
+	// 2. Delta since the watermark, excluding the current prompt. Stream-json
+	//    sends its entire final user suffix as the prompt, while the legacy
+	//    behavior (including ACP) excludes only the last message.
 	let start = Math.max(0, Math.floor(watermark));
 	if (lastCompactionIdx >= 0) start = Math.max(start, lastCompactionIdx + 1);
-	const end = Math.max(0, messages.length - 1);
+	const end = opts.excludeTrailingUserSuffix
+		? digestPrefixEnd
+		: Math.max(0, messages.length - 1);
 	for (let i = start; i < end; i++) {
 		const m = messages[i];
 		if (m.role === "assistant") {
@@ -1199,7 +1249,9 @@ async function runTurnDriver(
 		}
 		handle = active;
 	} else {
-		const prompt = extractUserPrompt(context);
+		// Only stream-json aggregates the final user suffix. ACP keeps its
+		// existing last-user behavior until its own prompt contract changes.
+		const prompt = deps.engine === "stream-json" ? extractStreamJsonPrompt(context) : extractUserPrompt(context);
 		const images = extractImages(context);
 		// An image-only message (no text) is valid on the ACP engine; only fail
 		// when there is nothing at all to send (no text, no images, no late
@@ -1214,8 +1266,17 @@ async function runTurnDriver(
 		const effort = entry?.efforts?.length ? toAgyEffort(options?.reasoning, entry.efforts) : undefined;
 		const watermark = existing?.lastMessageCount ?? 0;
 		// Late turns re-open the conversation with a synthetic prompt; the digest
-		// would re-send context agy already holds, so skip it.
-		const digest = config.digest && late.length === 0 ? buildContextDigest(context.messages, watermark) : "";
+		// would re-send context agy already holds, so skip it. Stream-json sends
+		// the whole final user suffix below, so exclude that same suffix from the
+		// digest. ACP keeps buildContextDigest's legacy last-message behavior.
+		const digest =
+			config.digest && late.length === 0
+				? buildContextDigest(
+						context.messages,
+						watermark,
+						deps.engine === "stream-json" ? { excludeTrailingUserSuffix: true } : undefined,
+					)
+				: "";
 		// G1 delivery per engine. stream-json: digest rides inline in the prompt
 		// (the CLI has no context channel). ACP: the server advertises
 		// `embeddedContext`, so the digest ships as a native resource block
