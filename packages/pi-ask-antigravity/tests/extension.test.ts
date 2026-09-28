@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it, test } from "vitest";
 import factory, {
 	type ModelEntry,
@@ -6,6 +9,8 @@ import factory, {
 	mergeCatalog,
 	parseModelLine,
 	resolveModel,
+	reviewerAgentMd,
+	stageReviewerAgent,
 } from "../extensions/index.js";
 
 // The REAL `agy models` stdout shape (verified live via `ct agy models`):
@@ -193,5 +198,49 @@ describe("buildFinalPrompt (headless plan-mode hardening)", () => {
 			buildFinalPrompt("do the edit", "accept-edits", true),
 			"(Use compact digests, not full file contents.)\ndo the edit",
 		);
+	});
+});
+
+// --- Plan-mode reviewer agent (enforced edit denial) ------------------------
+// Probed 2026-09-28 on agy 1.2.12: a per-call agent whose tools list carries
+// no file-editing tool reports "none" for edits (hard block, with or without
+// the skip flag); commandExecutionPolicy auto lets read commands run headless
+// with no user allow rules; plan discipline blocks a redirect-write. The
+// prompt guard alone was observed failing once (a sub-agent edited files),
+// so the toolset restriction is the real enforcement layer.
+
+describe("plan-mode reviewer agent (enforced edit denial)", () => {
+	test("agent-enforced plan run forbids file mutation, not commands", () => {
+		const out = buildFinalPrompt("review this", "plan", false, true);
+		assert.match(out, /Do not create, modify, or delete any files/);
+		assert.doesNotMatch(out, /Do not run shell commands/);
+		assert.match(out, /Read-only commands \(git log, git diff/);
+	});
+
+	test("agent-enforced accept-edits run is unchanged", () => {
+		assert.equal(buildFinalPrompt("do the edit", "accept-edits", false, true), "do the edit");
+	});
+
+	test("reviewerAgentMd: toolset must never contain a file-editing tool", () => {
+		const md = reviewerAgentMd("pi-bridge-ask-x");
+		assert.match(md, /^name: pi-bridge-ask-x$/m);
+		assert.match(md, /commandExecutionPolicy: auto/);
+		assert.match(md, /mainAgent: true/);
+		assert.doesNotMatch(md, /create_file/);
+		assert.doesNotMatch(md, /edit_file/);
+		assert.doesNotMatch(md, /write_file/);
+		assert.match(md, /- view_file/);
+		assert.match(md, /- run_command/);
+	});
+
+	test("stageReviewerAgent: creates a unique pid-marked agent dir under root", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "ask-agents-"));
+		const a = stageReviewerAgent(root);
+		const b = stageReviewerAgent(root);
+		assert.notEqual(a.name, b.name);
+		assert.match(a.name, /^pi-bridge-ask-/);
+		assert.ok(fs.existsSync(path.join(a.dir, "agent.md")));
+		assert.equal(fs.readFileSync(path.join(a.dir, ".pid"), "utf8").trim(), String(process.pid));
+		fs.rmSync(root, { recursive: true, force: true });
 	});
 });
