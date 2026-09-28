@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.9] - 2026-09-28
+
+### Fixed
+
+- **Plan-mode delegations enforce read-only instead of promising it.** Port of the bridge fix one commit earlier in the stack: the prompt-only guard failed in the field (a plan delegation behind an env-injected skip flag still edited files), so plan-mode runs now stage a temporary agy agent — `tools:` limited to `view_file` and `run_command`, `commandExecutionPolicy: auto`, `inheritMcp: false` — under the shared `~/.gemini/config/agents` discovery root and pass `--agent`. No file-editing tool in the toolset means no edit call is possible, with or without `--dangerously-skip-permissions` (probed on agy 1.2.12); the policy is what lets analysis commands run headless for users with no allow rules. With the agent staged, the skip flag returns under the shared `skipPermissions` knob; staging failure falls back fail-closed to no agent, no flag, and the strict all-commands-forbidden guard, with an env-injected skip flag stripped from `AGY_EXTRA_ARGS` on that path. Includes the standalone sweep for orphaned agent dirs (pid-marker doctrine), duplicated rather than extracted: the standalone stays self-contained per repo convention. Tool descriptions state the residual honestly: file-editing tools are hard-blocked, arbitrary shell execution under the flag is prompt-guarded alone.
+- **Headless plan prompts say what they cannot do.** Same hardening as the bridge: plan prompts append an explicit no-commands constraint and a state-what-is-missing instruction, converting the soft-denied empty-output death of a shell-command attempt into a visible missing-content request. On the enforced path the guard yields to the mutation-forbidding variant; the command-forbidding rule remains on the fallback path.
+
 ## [1.2.8] - 2026-09-25
 
 ### Fixed
