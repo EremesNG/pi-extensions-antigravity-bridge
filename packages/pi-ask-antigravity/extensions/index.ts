@@ -157,7 +157,7 @@ TWO MODES (you choose):
 - **Continued conversation**: pass the conversationId returned in the PREVIOUS call's details (details.conversationId). agy resumes that conversation with full context intact — use for follow-ups, multi-turn refinement, or when the user says "ask agy to follow up / continue / now do X based on what you just did". Thread the id from each result into the next call.
 
 EXECUTION MODES (param: mode):
-- **plan**: agy reviews and plans without writing. Use for cross-review and read-only tasks. Enforced: plan runs execute in a temporary restricted agent whose toolset has NO file-editing tools (hard block); shell-redirect writes stay prompt-guarded only; with skipPermissions on (default) commands still run for analysis. Inline the material to review - a plan run cannot fetch it.
+- **plan**: agy reviews and plans without writing. Use for cross-review and read-only tasks. Enforced: plan runs execute in a temporary restricted agent whose toolset has NO file-editing tools (hard block); the reviewer may still execute arbitrary shell commands, kept read-only by the prompt guard alone. Inline the material to review - a plan run cannot fetch it.
 - **accept-edits** (default): agy applies edits directly inside the workspace.
 - For agy's orthogonal \`--sandbox\` shell-containment flag, set the \`AGY_EXTRA_ARGS=--sandbox\` env var.
 
@@ -1107,7 +1107,7 @@ export default async function (pi: ExtensionAPI) {
 					],
 					{
 						description:
-							"agy execution mode. 'plan' = review-only (--mode plan in a temporary restricted agent: file-editing tools are hard-blocked; shell-redirect writes remain prompt-guarded; with skipPermissions on, commands still run for analysis). 'accept-edits' = agy applies edits directly (--mode accept-edits, default). For agy's orthogonal --sandbox shell-containment flag, set the AGY_EXTRA_ARGS env var.",
+							"agy execution mode. 'plan' = review-only (--mode plan in a temporary restricted agent: file-editing tools are hard-blocked; arbitrary shell commands remain prompt-guarded only; with skipPermissions on, commands still run for analysis). 'accept-edits' = agy applies edits directly (--mode accept-edits, default). For agy's orthogonal --sandbox shell-containment flag, set the AGY_EXTRA_ARGS env var.",
 						default: "accept-edits",
 					},
 				),
