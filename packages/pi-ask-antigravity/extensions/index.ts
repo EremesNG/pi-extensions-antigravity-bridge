@@ -29,6 +29,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -156,7 +157,7 @@ TWO MODES (you choose):
 - **Continued conversation**: pass the conversationId returned in the PREVIOUS call's details (details.conversationId). agy resumes that conversation with full context intact — use for follow-ups, multi-turn refinement, or when the user says "ask agy to follow up / continue / now do X based on what you just did". Thread the id from each result into the next call.
 
 EXECUTION MODES (param: mode):
-- **plan**: agy reviews and plans without writing. Use for cross-review and read-only tasks. Enforced: plan runs never receive the skip-permissions flag, so a write or command attempt ends the run quickly with a "confirm plan" message instead of executing.
+- **plan**: agy reviews and plans without writing. Use for cross-review and read-only tasks. Enforced: plan runs execute in a temporary restricted agent whose toolset has NO file-editing tools (hard block); the reviewer may still execute arbitrary shell commands, kept read-only by the prompt guard alone. Inline the material to review - a plan run cannot fetch it.
 - **accept-edits** (default): agy applies edits directly inside the workspace.
 - For agy's orthogonal \`--sandbox\` shell-containment flag, set the \`AGY_EXTRA_ARGS=--sandbox\` env var.
 
@@ -280,6 +281,150 @@ function saveConfig(patch: Partial<Config>): SaveResult {
 		throw err;
 	}
 	return { path: targetPath, routedToProject: projectShadows };
+}
+
+// --- Prompt assembly -------------------------------------------------------
+
+/** Appended to every headless plan-mode prompt. `agy -p` cannot answer
+ *  permission prompts: in plan mode a run_command attempt is soft-denied and
+ *  the turn ends AT the denial (exit 0, empty stdout, notice only on stderr -
+ *  the empty-output branch in execute). Probed 2026-09-28 on agy 1.2.12:
+ *  allow rules ARE consulted (a verbatim allow-listed `git log` runs), but
+ *  --sandbox does NOT relax the command gate, so the only input every user
+ *  is guaranteed is the prompt itself. The guard steers the model to answer
+ *  from that material. accept-edits runs keep their tools and never get it. */
+export const PLAN_HEADLESS_GUARD = [
+	"",
+	"--- Headless session constraints ---",
+	"- Do not run shell commands. Command execution is denied in this session, and any attempt ends the session immediately with no answer.",
+	"- Work only from the material provided in this prompt.",
+	"- If information you need is missing, state exactly what is missing in your answer instead of trying to fetch it.",
+].join("\n");
+
+/** Guard for plan runs backed by the restricted reviewer agent. Difference
+ *  to PLAN_HEADLESS_GUARD: commands are the analysis capability here (the
+ *  agent's commandExecutionPolicy auto-approves them headless, probed
+ *  2026-09-28), so the guard forbids FILE MUTATION - by tool or by shell -
+ *  and keeps the answer-from-material discipline. */
+export const AGENT_REVIEW_GUARD = [
+	"",
+	"--- Review constraints ---",
+	"- Read-only review. Do not create, modify, or delete any files, including through shell commands (no redirects, tee, rm, mv, git commit).",
+	"- Read-only commands (git log, git diff, git show, rg, ls, cat, test runners) are allowed for analysis.",
+	"- Work from the material provided in this prompt; if information you need is missing, state exactly what is missing in your answer.",
+].join("\n");
+
+/** Assemble the prompt sent to agy: digest marker first (existing behavior),
+ *  then the caller's prompt, then the plan-mode guard last - the position
+ *  the model reads with the most recency. No user-config mutation: this is
+ *  the only plan-mode lever the tool itself owns. */
+export function buildFinalPrompt(
+	prompt: string,
+	mode: Mode,
+	digest: boolean,
+	/** True when the restricted reviewer agent is staged: its empty edit
+	 *  toolset is the hard block, so the prompt may ALLOW read-only commands. */
+	agentEnforced = false,
+): string {
+	let out = digest ? `(Use compact digests, not full file contents.)\n${prompt}` : prompt;
+	if (mode === "plan") out += agentEnforced ? AGENT_REVIEW_GUARD : PLAN_HEADLESS_GUARD;
+	return out;
+}
+
+// --- Plan-mode reviewer agent ----------------------------------------------
+
+const ASK_AGENT_PREFIX = "pi-bridge-ask-";
+const ASK_AGENT_TOOLS = ["view_file", "run_command"];
+
+/** Temp agent dirs share the ~/.gemini/config/agents discovery root; the
+ *  AGY_AGENTS_ROOT override exists for tests and sandboxes. */
+export function askAgentsRoot(): string {
+	return process.env.AGY_AGENTS_ROOT ?? path.join(os.homedir(), ".gemini", "config", "agents");
+}
+
+/** agent.md for the plan-mode reviewer. The tools list is the ENFORCEMENT:
+ *  with no file-editing tool present the model cannot emit an edit call at
+ *  all (probed 2026-09-28 on agy 1.2.12: the toolset reports "none" for
+ *  edits, with and without the skip flag). commandExecutionPolicy auto is
+ *  what lets read commands run headless with no user allow rules. Never add
+ *  a write-capable tool here. */
+export function reviewerAgentMd(name: string): string {
+	return [
+		"---",
+		`name: ${name}`,
+		"description: Temporary Pi plan-mode reviewer",
+		"mainAgent: true",
+		"subagent: false",
+		"model: inherit",
+		"excludeDefaultComponents: true",
+		"inheritCustomizations: false",
+		"inheritMcp: false",
+		"commandExecutionPolicy: auto",
+		"tools:",
+		...ASK_AGENT_TOOLS.map((t) => `  - ${t}`),
+		"skills: []",
+		"rules: []",
+		"agents: []",
+		"mcpServers: []",
+		"---",
+		"",
+		"You are a strict read-only code reviewer. Review, analyze, and plan; never modify anything.",
+		"",
+	].join("\n");
+}
+
+/** Stage one unique reviewer agent (agent.md + pid marker) under root. Same
+ *  hygiene doctrine as the web delegates: nonce-named, cleaned in finally,
+ *  orphans swept by pid marker at registration. */
+export function stageReviewerAgent(root: string): { name: string; dir: string } {
+	fs.mkdirSync(root, { recursive: true });
+	const name = `${ASK_AGENT_PREFIX}${process.pid}-${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
+	const dir = path.join(root, name);
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	fs.writeFileSync(path.join(dir, "agent.md"), reviewerAgentMd(name), { mode: 0o600 });
+	fs.writeFileSync(path.join(dir, ".pid"), `${process.pid}\n`, { mode: 0o600 });
+	return { name, dir };
+}
+
+/** Remove leftover reviewer agent dirs: dead-pid markers always, marker-less
+ *  dirs only after the grace period (a live sibling may sit between mkdir and
+ *  its pid write). Never touches foreign agent dirs. */
+export function sweepStaleAskAgents(
+	root: string = askAgentsRoot(),
+	now = Date.now(),
+	prefix: string = ASK_AGENT_PREFIX,
+): void {
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(root);
+	} catch {
+		return; // no agents dir yet: nothing to sweep
+	}
+	for (const entry of entries) {
+		if (!entry.startsWith(prefix)) continue;
+		const dir = path.join(root, entry);
+		try {
+			let stale: boolean;
+			try {
+				const pid = Number.parseInt(fs.readFileSync(path.join(dir, ".pid"), "utf8").trim(), 10);
+				stale = Number.isInteger(pid) && pid > 0 ? !pidAlive(pid) : now - fs.statSync(dir).mtimeMs > 24 * 60 * 60 * 1000;
+			} catch {
+				stale = now - fs.statSync(dir).mtimeMs > 24 * 60 * 60 * 1000;
+			}
+			if (stale) fs.rmSync(dir, { recursive: true, force: true });
+		} catch {
+			// vanished mid-sweep: nothing to remove
+		}
+	}
+}
+
+function pidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 // --- Model parsing + alias resolution --------------------------------------
@@ -776,6 +921,14 @@ export default async function (pi: ExtensionAPI) {
 	// before (standalone tool).
 	if (isBridgeInstalled()) return;
 
+	// Orphan sweep for the plan-mode reviewer agents (SIGKILL can skip the
+	// run's finally): same pid-marker doctrine as the bridge's web delegates.
+	try {
+		sweepStaleAskAgents();
+	} catch {
+		// a sweep failure must never block registration
+	}
+
 	const binary = resolveAgy();
 	// Discovered once at load; frozen for the session. Run /reload after an
 	// `agy update` to refresh. Failure is non-fatal: resolveModel falls back
@@ -954,7 +1107,7 @@ export default async function (pi: ExtensionAPI) {
 					],
 					{
 						description:
-							"agy execution mode. 'plan' = review-only, no edits (--mode plan; the skip-permissions flag is never passed, so write and command attempts fail visibly at plan approval). 'accept-edits' = agy applies edits directly (--mode accept-edits, default). For agy's orthogonal --sandbox shell-containment flag, set the AGY_EXTRA_ARGS env var.",
+							"agy execution mode. 'plan' = review-only (--mode plan in a temporary restricted agent: file-editing tools are hard-blocked; arbitrary shell commands remain prompt-guarded only; with skipPermissions on, commands still run for analysis). 'accept-edits' = agy applies edits directly (--mode accept-edits, default). For agy's orthogonal --sandbox shell-containment flag, set the AGY_EXTRA_ARGS env var.",
 						default: "accept-edits",
 					},
 				),
@@ -1162,6 +1315,19 @@ export default async function (pi: ExtensionAPI) {
 			const snapshot = isContinuation ? null : snapshotConversations(CONVERSATIONS_DIR);
 
 			const mode: Mode = (params.mode as Mode | undefined) ?? "accept-edits";
+			// Plan runs stage a restricted reviewer agent: its tools list has NO
+			// file-editing tool, which is the hard edit block (the prompt guard
+			// alone was observed failing once - a sub-agent still edited files).
+			// Staging failure degrades to the legacy fallback: no agent, no skip
+			// flag, the stricter command-forbidding guard.
+			let reviewerAgent: { name: string; dir: string } | null = null;
+			if (mode === "plan") {
+				try {
+					reviewerAgent = stageReviewerAgent(askAgentsRoot());
+				} catch {
+					reviewerAgent = null;
+				}
+			}
 			// digest default: on for plan (review-only contexts where full file
 			// contents are noise), off for accept-edits (agy applies edits and
 			// may need richer context for diffs).
@@ -1169,9 +1335,12 @@ export default async function (pi: ExtensionAPI) {
 				typeof params.digest === "boolean"
 					? params.digest
 					: mode === "plan";
-			const finalPrompt: string = useDigest
-				? `(Use compact digests, not full file contents.)\n${params.prompt}`
-				: params.prompt;
+			const finalPrompt: string = buildFinalPrompt(
+				params.prompt,
+				mode,
+				useDigest,
+				reviewerAgent !== null,
+			);
 
 			// Opt-in full-context export (isolated stays the default).
 			let contextFile: string | null = null;
@@ -1197,22 +1366,30 @@ export default async function (pi: ExtensionAPI) {
 				: finalPrompt;
 
 			const args: string[] = ["--add-dir", cwd];
-			const extra = extraArgs();
+			const extraRaw = extraArgs();
+			// Fail-closed on the fallback path: AGY_EXTRA_ARGS lands before the
+			// mode flags, so an env-injected skip flag would re-arm what the
+			// plan-mode rule strips. Only the enforced agent makes the flag safe.
+			const extra =
+				mode === "plan" && !reviewerAgent
+					? extraRaw.filter((a) => a !== "--dangerously-skip-permissions")
+					: extraRaw;
 			if (extra.length) args.push(...extra);
 			if (resolved.model) args.push("--model", resolved.model);
 			if (resolved.effort) args.push("--effort", resolved.effort);
 			args.push("--mode", mode);
+			if (reviewerAgent) args.push("--agent", reviewerAgent.name);
 			// accept-edits auto-approves file edits but NOT shell commands, so a
 			// run_command would hang on an unanswerable y/n prompt in non-interactive
 			// -p mode. Honor the shared permissions setting (same knob as the bridge).
-			// Plan mode never gets the flag even when the knob is on: the flag
-			// auto-approves ALL permission requests including plan mode's own
-			// approval gate, which would silently turn "review-only" into full
-			// write access inside --add-dir (probed 2026-09-25: with the flag a
-			// plan run wrote files; without it, file and command attempts end
-			// exit 0 in ~20-30s with a "confirm plan" message - fail-visible,
-			// never a hang). Same fix as the bridge's ask-tool and driver.
-			if (mode !== "plan" && config.skipPermissions) {
+			// Plan runs WITH the reviewer agent: the flag is safe again because the
+			// agent's toolset has no file-editing tool - the 2026-09-25 write
+			// incident rode edit tools that existed then; probed 2026-09-28 the
+			// restricted toolset reports "none" for edits even with the flag. The
+			// flag is what lets analysis commands (builds, test runners) run for
+			// users without allow rules. Plan fallback (staging failed): strict
+			// legacy behavior, no flag - the prompt guard is all that is left.
+			if (config.skipPermissions && (mode !== "plan" || reviewerAgent !== null)) {
 				args.push("--dangerously-skip-permissions");
 			}
 			if (isContinuation) args.push("--conversation", rawConvId as string);
@@ -1454,7 +1631,7 @@ export default async function (pi: ExtensionAPI) {
 					const note = [
 						"agy exited cleanly but produced no output.",
 						details.stderr.trim() ? `stderr: ${details.stderr.trim()}` : null,
-						"Common cause: a tool call needed a permission that headless mode cannot prompt for (typically the command gate in plan mode), so it was auto-denied. Allow-list it under permissions.allow in ~/.gemini/antigravity-cli/settings.json, or rerun outside plan mode with skipPermissions.",
+						"Common cause: a tool call needed a permission that headless mode cannot prompt for (typically the command gate in plan mode), so it was auto-denied and the turn ended with no answer. Recovery: retry in plan mode with all needed content inlined in the prompt - plan runs cannot fetch it, commands are denied. Or rerun outside plan mode with skipPermissions, or add your own permissions.allow rules in ~/.gemini/antigravity-cli/settings.json.",
 					]
 						.filter(Boolean)
 						.join(" ");
@@ -1493,6 +1670,11 @@ export default async function (pi: ExtensionAPI) {
 				if (contextFile) {
 					try {
 						fs.unlinkSync(contextFile);
+					} catch {}
+				}
+				if (reviewerAgent) {
+					try {
+						fs.rmSync(reviewerAgent.dir, { recursive: true, force: true });
 					} catch {}
 				}
 			}

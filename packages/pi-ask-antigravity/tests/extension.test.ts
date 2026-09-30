@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it, test } from "vitest";
 import factory, {
 	type ModelEntry,
+	buildFinalPrompt,
 	mergeCatalog,
 	parseModelLine,
 	resolveModel,
+	reviewerAgentMd,
+	stageReviewerAgent,
 } from "../extensions/index.js";
 
 // The REAL `agy models` stdout shape (verified live via `ct agy models`):
@@ -157,5 +163,84 @@ test("resolveModel: short aliases still resolve when agy omits them (static over
 		assert.deepEqual(resolveModel("gpt-oss", geminiOnly, DEFAULT_THINKING), {
 			model: "gpt-oss-120b-medium",
 		});
+	});
+});
+
+// --- Prompt assembly (headless plan-mode hardening) ------------------------
+// Root cause probed 2026-09-28: `agy -p --mode plan` soft-denies run_command
+// and the turn ends AT the denial (exit 0, empty stdout, no second model
+// turn), so one unguarded command attempt kills the whole run. The prompt is
+// the only lever the tool owns without touching user config.
+
+describe("buildFinalPrompt (headless plan-mode hardening)", () => {
+	test("plan mode appends the no-commands guard", () => {
+		const out = buildFinalPrompt("Review the diff.\n---\ndiff body", "plan", false);
+		assert.ok(out.startsWith("Review the diff."));
+		assert.match(out, /Do not run shell commands/);
+		assert.match(out, /ends the session immediately/);
+		assert.ok(
+			out.endsWith("state exactly what is missing in your answer instead of trying to fetch it."),
+		);
+	});
+
+	test("plan + digest keeps digest prefix first, guard last", () => {
+		const out = buildFinalPrompt("body", "plan", true);
+		assert.ok(out.startsWith("(Use compact digests, not full file contents.)\n"));
+		assert.ok(out.includes("(Use compact digests, not full file contents.)\nbody\n"));
+		assert.ok(out.endsWith("instead of trying to fetch it."));
+	});
+
+	test("accept-edits never carries the guard", () => {
+		// Edit runs keep their tools under skip-permissions; appending the guard
+		// would break delegated edits and command use.
+		assert.equal(buildFinalPrompt("do the edit", "accept-edits", false), "do the edit");
+		assert.equal(
+			buildFinalPrompt("do the edit", "accept-edits", true),
+			"(Use compact digests, not full file contents.)\ndo the edit",
+		);
+	});
+});
+
+// --- Plan-mode reviewer agent (enforced edit denial) ------------------------
+// Probed 2026-09-28 on agy 1.2.12: a per-call agent whose tools list carries
+// no file-editing tool reports "none" for edits (hard block, with or without
+// the skip flag); commandExecutionPolicy auto lets read commands run headless
+// with no user allow rules; plan discipline blocks a redirect-write. The
+// prompt guard alone was observed failing once (a sub-agent edited files),
+// so the toolset restriction is the real enforcement layer.
+
+describe("plan-mode reviewer agent (enforced edit denial)", () => {
+	test("agent-enforced plan run forbids file mutation, not commands", () => {
+		const out = buildFinalPrompt("review this", "plan", false, true);
+		assert.match(out, /Do not create, modify, or delete any files/);
+		assert.doesNotMatch(out, /Do not run shell commands/);
+		assert.match(out, /Read-only commands \(git log, git diff/);
+	});
+
+	test("agent-enforced accept-edits run is unchanged", () => {
+		assert.equal(buildFinalPrompt("do the edit", "accept-edits", false, true), "do the edit");
+	});
+
+	test("reviewerAgentMd: toolset must never contain a file-editing tool", () => {
+		const md = reviewerAgentMd("pi-bridge-ask-x");
+		assert.match(md, /^name: pi-bridge-ask-x$/m);
+		assert.match(md, /commandExecutionPolicy: auto/);
+		assert.match(md, /mainAgent: true/);
+		assert.doesNotMatch(md, /create_file/);
+		assert.doesNotMatch(md, /edit_file/);
+		assert.doesNotMatch(md, /write_file/);
+		assert.match(md, /- view_file/);
+		assert.match(md, /- run_command/);
+	});
+
+	test("stageReviewerAgent: creates a unique pid-marked agent dir under root", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "ask-agents-"));
+		const a = stageReviewerAgent(root);
+		const b = stageReviewerAgent(root);
+		assert.notEqual(a.name, b.name);
+		assert.match(a.name, /^pi-bridge-ask-/);
+		assert.ok(fs.existsSync(path.join(a.dir, "agent.md")));
+		assert.equal(fs.readFileSync(path.join(a.dir, ".pid"), "utf8").trim(), String(process.pid));
+		fs.rmSync(root, { recursive: true, force: true });
 	});
 });
